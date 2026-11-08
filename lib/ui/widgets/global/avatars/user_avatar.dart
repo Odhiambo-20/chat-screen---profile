@@ -1,0 +1,481 @@
+import 'package:wrytte/ui/theme/wrytte_colors.dart';
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:wrytte/services/auth/api_service.dart';
+import 'package:wrytte/services/auth/auth_service.dart';
+import 'package:wrytte/services/user/avatar_preload_service.dart';
+import 'package:wrytte/services/matrix/matrix_client.dart';
+import 'package:wrytte/services/matrix/matrix_config.dart';
+import 'package:wrytte/utils/apk_debug_logger.dart';
+
+class UserAvatar extends StatefulWidget {
+  final double size;
+  final ImageProvider? image;
+  final String? imageUrl;
+  final String? localImagePath;
+  final String? name;
+  final VoidCallback? onTap;
+  final String? heroTag;
+  final String? cacheIdentity;
+  final bool isDeleted;
+  final bool suppressAvatar;
+
+  static void clearMemoryCache() => _UserAvatarState.clearMemoryCache();
+
+  const UserAvatar({
+    super.key,
+    this.size = 40.0,
+    this.image,
+    this.imageUrl,
+    this.localImagePath,
+    this.name,
+    this.onTap,
+    this.heroTag,
+    this.cacheIdentity,
+    this.isDeleted = false,
+    this.suppressAvatar = false,
+  });
+
+  @override
+  State<UserAvatar> createState() => _UserAvatarState();
+}
+
+class _UserAvatarState extends State<UserAvatar> {
+  // ── App-wide resolved-image cache ───────────────────────────────────────
+  // Once a CachedNetworkImage for a given URL has successfully resolved at
+  // least once (this app session), we remember its ImageProvider here. Any
+  // future build for the same URL — even in a brand new UserAvatar instance
+  // after a parent rebuild — paints directly from this provider with zero
+  // placeholder frame. This is what actually stops the flicker, because
+  // CachedNetworkImage's `placeholder` builder still renders for one frame
+  // on every widget rebuild while it asynchronously checks its disk cache,
+  // even if the bytes are already on disk.
+  static final Map<String, ImageProvider> _resolvedImageCache = {};
+  static final Set<String> _loggedPaintKeys = {};
+  static final Set<String> _loggedLoadKeys = {};
+
+  // Tracks which raw localImagePath strings have been confirmed to exist on
+  // disk, so we don't repeatedly hit File.existsSync() and so a transient
+  // "file missing" check (e.g. mid-write) doesn't permanently blacklist a
+  // path that becomes valid moments later.
+  static final Set<String> _knownGoodLocalPaths = {};
+
+  /// Clears account-scoped avatar state during logout. Image providers can
+  /// otherwise retain references after Flutter's global image cache is wiped.
+  static void clearMemoryCache() {
+    _resolvedImageCache.clear();
+    _loggedPaintKeys.clear();
+    _loggedLoadKeys.clear();
+    _knownGoodLocalPaths.clear();
+  }
+
+  String? _backendToken;
+  String? _lastGoodImageUrl;
+  String? _lastGoodLocalImagePath;
+
+  @override
+  void initState() {
+    super.initState();
+    AvatarPreloadService.cacheRevision.addListener(_onAvatarCacheChanged);
+    _rememberStableSources();
+    _warmAuthToken();
+  }
+
+  void _onAvatarCacheChanged() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    AvatarPreloadService.cacheRevision.removeListener(_onAvatarCacheChanged);
+    super.dispose();
+  }
+
+  @override
+  void didUpdateWidget(covariant UserAvatar oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final imageWasRemoved =
+        (oldWidget.imageUrl?.trim().isNotEmpty == true ||
+            oldWidget.localImagePath?.trim().isNotEmpty == true) &&
+        (widget.imageUrl?.trim().isEmpty != false) &&
+        (widget.localImagePath?.trim().isEmpty != false);
+    if (imageWasRemoved) {
+      // An empty source is an explicit removal, not a reason to keep showing
+      // the previous successful avatar for this cache identity.
+      _lastGoodImageUrl = null;
+      _lastGoodLocalImagePath = null;
+    }
+    if (oldWidget.cacheIdentity != widget.cacheIdentity) {
+      _lastGoodImageUrl = null;
+      _lastGoodLocalImagePath = null;
+    }
+    _rememberStableSources();
+    if (oldWidget.imageUrl != widget.imageUrl) {
+      _warmAuthToken();
+    }
+  }
+
+  void _rememberStableSources() {
+    final imageUrl = widget.imageUrl?.trim() ?? '';
+    if (imageUrl.isNotEmpty) _lastGoodImageUrl = imageUrl;
+
+    final localPath = widget.localImagePath?.trim() ?? '';
+    if (localPath.isNotEmpty) {
+      if (_knownGoodLocalPaths.contains(localPath)) {
+        _lastGoodLocalImagePath = localPath;
+      } else if (File(localPath).existsSync()) {
+        _knownGoodLocalPaths.add(localPath);
+        _lastGoodLocalImagePath = localPath;
+      }
+    }
+  }
+
+  void _warmAuthToken() {
+    final rawUrl = widget.imageUrl?.trim() ?? '';
+    final resolved = _resolveImageUrl(rawUrl);
+    final host = Uri.tryParse(resolved)?.host.toLowerCase() ?? '';
+    final needsBackendToken =
+        rawUrl.startsWith('/usrimg/') ||
+        host == 'wryttedev.azurewebsites.net' ||
+        host == 'wrytte.com';
+    if (!needsBackendToken) return;
+    final cached = AuthService.instance.cachedBackendToken?.trim() ?? '';
+    if (cached.isNotEmpty) {
+      _backendToken = cached;
+      return;
+    }
+    AuthService.instance
+        .getValidBackendToken()
+        .then((token) {
+          final clean = token?.trim() ?? '';
+          if (!mounted || clean.isEmpty || clean == _backendToken) return;
+          setState(() => _backendToken = clean);
+        })
+        .catchError((error) {
+          debugPrint('[UserAvatar] auth token warm skipped: $error');
+        });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    debugPrint(
+      '[UserAvatar] build size=${widget.size} '
+      'image=${widget.imageUrl?.trim().isNotEmpty == true} '
+      'local=${widget.localImagePath?.trim().isNotEmpty == true} '
+      'name="${widget.name}" cache="${widget.cacheIdentity ?? ''}"',
+    );
+    Widget avatarWidget;
+
+    if (widget.isDeleted) {
+      return _wrapAvatar(_buildDeletedGhost());
+    }
+
+    final localFile = _localImageFile();
+
+    final imageUrl = _effectiveImageUrl();
+    final cachedProvider = imageUrl.isNotEmpty
+        ? _resolvedImageCache[_providerCacheKey(imageUrl)]
+        : null;
+
+    if (widget.image != null) {
+      avatarWidget = _buildFromImageProvider(widget.image!);
+    } else if (localFile != null) {
+      _lastGoodLocalImagePath = localFile.path;
+      avatarWidget = ClipOval(
+        child: Image.file(
+          localFile,
+          width: widget.size,
+          height: widget.size,
+          fit: BoxFit.cover,
+          errorBuilder: (context, error, stackTrace) {
+            debugPrint(
+              '[UserAvatar] local image load failed path="${localFile.path}" error=$error',
+            );
+            _knownGoodLocalPaths.remove(localFile.path);
+            if (cachedProvider != null) {
+              return _buildFromImageProvider(
+                cachedProvider,
+                cacheKey: _providerCacheKey(imageUrl),
+              );
+            }
+            return imageUrl.isNotEmpty
+                ? _buildNetworkOrPlaceholder(imageUrl)
+                : _buildPlaceholder();
+          },
+        ),
+      );
+    } else if (cachedProvider != null) {
+      // We've already successfully rendered this exact URL before in this
+      // session — paint directly from the resolved provider. No
+      // CachedNetworkImage, no placeholder frame, no flicker.
+      _logPaintOnce(imageUrl, source: 'memory_cache');
+      avatarWidget = _buildFromImageProvider(
+        cachedProvider,
+        cacheKey: _providerCacheKey(imageUrl),
+      );
+    } else if (imageUrl.isNotEmpty) {
+      avatarWidget = _buildNetworkOrPlaceholder(imageUrl);
+    } else {
+      avatarWidget = _buildPlaceholder();
+    }
+
+    return _wrapAvatar(avatarWidget);
+  }
+
+  Widget _wrapAvatar(Widget avatarWidget) {
+    final wrapped = GestureDetector(
+      onTap: widget.onTap,
+      child: SizedBox(
+        width: widget.size,
+        height: widget.size,
+        child: avatarWidget,
+      ),
+    );
+    return widget.heroTag != null
+        ? Hero(tag: widget.heroTag!, child: wrapped)
+        : wrapped;
+  }
+
+  Widget _buildDeletedGhost() {
+    return Container(
+      decoration: const BoxDecoration(
+        shape: BoxShape.circle,
+        color: Color(0xFF2A6BD4),
+      ),
+      child: Icon(
+        Icons.person_off_rounded,
+        size: widget.size * 0.55,
+        color: Colors.white,
+      ),
+    );
+  }
+
+  Widget _buildFromImageProvider(ImageProvider provider, {String? cacheKey}) {
+    return ClipOval(
+      child: Image(
+        image: provider,
+        width: widget.size,
+        height: widget.size,
+        fit: BoxFit.cover,
+        errorBuilder: (context, error, stackTrace) {
+          if (cacheKey != null) _resolvedImageCache.remove(cacheKey);
+          debugPrint('[UserAvatar] provider load failed error="$error"');
+          apkLog(
+            'Avatar.load',
+            'state="failed" source="resolved_provider" '
+                'identity="${widget.cacheIdentity ?? ''}" '
+                'url="${cacheKey ?? ''}" error="$error"',
+          );
+          return _buildPlaceholder();
+        },
+      ),
+    );
+  }
+
+  File? _localImageFile() {
+    final path =
+        (widget.localImagePath?.trim().isNotEmpty == true
+                ? widget.localImagePath
+                : _lastGoodLocalImagePath)
+            ?.trim() ??
+        '';
+    if (path.isEmpty) return null;
+    if (_knownGoodLocalPaths.contains(path)) return File(path);
+    final file = File(path);
+    if (file.existsSync()) {
+      _knownGoodLocalPaths.add(path);
+      return file;
+    }
+    return null;
+  }
+
+  String _effectiveImageUrl() {
+    final direct = widget.imageUrl?.trim() ?? '';
+    if (direct.isNotEmpty) return direct;
+    return _lastGoodImageUrl?.trim() ?? '';
+  }
+
+  Widget _buildNetworkOrPlaceholder(String rawUrl) {
+    if (rawUrl.trim().startsWith('assets/')) {
+      return ClipOval(
+        child: Image.asset(
+          rawUrl.trim(),
+          width: widget.size,
+          height: widget.size,
+          fit: BoxFit.cover,
+          errorBuilder: (context, error, stackTrace) => _buildPlaceholder(),
+        ),
+      );
+    }
+    final url = _resolveImageUrl(rawUrl);
+    if (url.isEmpty) return _buildPlaceholder();
+    final providerKey = _providerCacheKey(rawUrl);
+    final logIdentity = widget.cacheIdentity?.trim().isNotEmpty == true
+        ? widget.cacheIdentity!.trim()
+        : providerKey;
+    if (_loggedLoadKeys.add(providerKey)) {
+      apkLog(
+        'Avatar.load',
+        'state="started" identity="$logIdentity" '
+            'size=${widget.size} url="$url"',
+      );
+    }
+    return ClipOval(
+      child: CachedNetworkImage(
+        imageUrl: url,
+        cacheKey: providerKey,
+        imageBuilder: (context, imageProvider) {
+          _lastGoodImageUrl = rawUrl;
+          // Remember this provider so every future build (including in
+          // other UserAvatar instances for the same URL — other screens,
+          // conversation tiles, profile page, etc.) can skip straight to
+          // painting it with zero placeholder frame.
+          _resolvedImageCache[providerKey] = imageProvider;
+          _logPaintOnce(rawUrl, source: 'network_or_disk_cache');
+          return Image(
+            image: imageProvider,
+            width: widget.size,
+            height: widget.size,
+            fit: BoxFit.cover,
+            errorBuilder: (context, error, stackTrace) {
+              _resolvedImageCache.remove(providerKey);
+              debugPrint(
+                '[UserAvatar] imageBuilder load failed url="$url" error=$error',
+              );
+              apkLog(
+                'Avatar.load',
+                'state="failed" source="image_builder" '
+                    'identity="$logIdentity" size=${widget.size} '
+                    'url="$url" error="$error"',
+              );
+              return _buildPlaceholder();
+            },
+          );
+        },
+        httpHeaders: _authHeaders(
+          _backendToken ?? AuthService.instance.cachedBackendToken,
+          rawUrl: rawUrl,
+        ),
+        width: widget.size,
+        height: widget.size,
+        fit: BoxFit.cover,
+        fadeInDuration: Duration.zero,
+        fadeOutDuration: Duration.zero,
+        placeholderFadeInDuration: Duration.zero,
+        useOldImageOnUrlChange: true,
+        placeholder: (context, url) => _buildPlaceholder(),
+        errorWidget: (context, url, error) {
+          _resolvedImageCache.remove(providerKey);
+          debugPrint('[UserAvatar] image load failed url="$url" error=$error');
+          apkLog(
+            'Avatar.load',
+            'state="failed" identity="$logIdentity" '
+                'size=${widget.size} url="$url" error="$error"',
+          );
+          return _buildPlaceholder();
+        },
+      ),
+    );
+  }
+
+  void _logPaintOnce(String rawUrl, {required String source}) {
+    final key = _providerCacheKey(rawUrl);
+    if (!_loggedPaintKeys.add(key)) return;
+    final logIdentity = widget.cacheIdentity?.trim().isNotEmpty == true
+        ? widget.cacheIdentity!.trim()
+        : key;
+    apkLog(
+      'Avatar.load',
+      'state="painted" source="$source" '
+          'identity="$logIdentity" size=${widget.size} '
+          'url="${_resolveImageUrl(rawUrl)}"',
+    );
+  }
+
+  String _providerCacheKey(String rawUrl) {
+    final url = _resolveImageUrl(rawUrl);
+    return url;
+  }
+
+  String _resolveImageUrl(String? raw) {
+    final url = raw?.trim() ?? '';
+    if (url.isEmpty) return '';
+    if (url.startsWith('mxc://')) return _resolveMxcUrl(url);
+    return url.startsWith('/') ? '${ApiService.baseUrl}$url' : url;
+  }
+
+  String _resolveMxcUrl(String raw) {
+    final uri = Uri.tryParse(raw);
+    if (uri == null || !uri.isScheme('mxc')) return '';
+    final mediaId = uri.pathSegments.join('/');
+    if (uri.host.isEmpty || mediaId.isEmpty) return '';
+    final homeserver = Uri.tryParse(MatrixConfig.homeserver);
+    if (homeserver == null || !homeserver.hasScheme) return '';
+    return homeserver
+        .resolve(
+          '/_matrix/client/v1/media/download/'
+          '${Uri.encodeComponent(uri.host)}/'
+          '${Uri.encodeComponent(mediaId)}',
+        )
+        .toString();
+  }
+
+  Map<String, String>? _authHeaders(String? token, {required String rawUrl}) {
+    if (rawUrl.trim().startsWith('mxc://')) {
+      final matrixToken =
+          MatrixClientService.instance.client.accessToken?.trim() ?? '';
+      return matrixToken.isEmpty
+          ? null
+          : {'Authorization': 'Bearer $matrixToken'};
+    }
+
+    final clean = token?.trim() ?? '';
+    if (clean.isEmpty) return null;
+    final uri = Uri.tryParse(rawUrl);
+    final isWrytteImage =
+        rawUrl.startsWith('/usrimg/') ||
+        uri?.host.toLowerCase() == 'wryttedev.azurewebsites.net' ||
+        uri?.host.toLowerCase() == 'wrytte.com';
+    if (!isWrytteImage) return null;
+    return {'Authorization': 'Bearer $clean'};
+  }
+
+  Widget _buildPlaceholder() {
+    // Show initials if name is available, otherwise icon
+    final initials = _getInitials(widget.name);
+
+    return Container(
+      decoration: const BoxDecoration(
+        shape: BoxShape.circle,
+        color: Color(0xFF0F2A44),
+      ),
+      child: Center(
+        child: initials != null
+            ? Text(
+                initials,
+                style: TextStyle(
+                  color: WrytteColors.primary,
+                  fontSize: widget.size * 0.36,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: 0.5,
+                ),
+              )
+            : Icon(
+                Icons.person,
+                size: widget.size * 0.5,
+                color: WrytteColors.primary,
+              ),
+      ),
+    );
+  }
+
+  /// Returns up to 2 initials from the name, or null if name is empty.
+  String? _getInitials(String? name) {
+    if (name == null || name.trim().isEmpty) return null;
+    final parts = name.trim().split(RegExp(r'\s+'));
+    if (parts.length == 1) return parts[0][0].toUpperCase();
+    return (parts[0][0] + parts[1][0]).toUpperCase();
+  }
+}
